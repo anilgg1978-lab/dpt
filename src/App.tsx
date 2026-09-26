@@ -171,17 +171,37 @@ export default function App() {
       typeof process !== 'undefined' && process.env?.GEMINI_API_KEY
         ? process.env.GEMINI_API_KEY
         : '';
-    if (envKey && envKey !== 'GEMINI_API_KEY') return envKey;
-    if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_GEMINI_API_KEY) {
+    if (
+      envKey &&
+      envKey !== 'GEMINI_API_KEY' &&
+      envKey !== 'MY_GEMINI_API_KEY' &&
+      !envKey.startsWith('AQ.')
+    ) {
+      return envKey;
+    }
+    if (
+      typeof import.meta !== 'undefined' &&
+      import.meta.env?.VITE_GEMINI_API_KEY &&
+      import.meta.env.VITE_GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+    ) {
       return import.meta.env.VITE_GEMINI_API_KEY;
     }
-    return win.GEMINI_API_KEY || win.API_KEY || envKey || 'GEMINI_API_KEY';
+    // Only use the 'GEMINI_API_KEY' shim placeholder when running inside the AI Studio preview iframe
+    if (win.aistudio && window.self !== window.top) {
+      return win.GEMINI_API_KEY || win.API_KEY || 'GEMINI_API_KEY';
+    }
+    return '';
   };
 
   // Direct REST fallback when /api/* routes are not mounted (e.g. static preview or Vercel static hosting)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const directGeminiFallback = async (url: string, payload: Record<string, any>): Promise<any> => {
     const apiKey = getClientApiKey();
+    if (!apiKey) {
+      throw new Error(
+        'GEMINI_API_KEY is missing in Vercel. Add GEMINI_API_KEY (from aistudio.google.com/apikey) in Vercel Settings → Environment Variables and Redeploy.'
+      );
+    }
     const baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 
     if (url === '/api/chat') {
@@ -495,7 +515,13 @@ export default function App() {
       }
 
       if (!res.ok) {
-        if (res.status === 404 || res.status === 502 || res.status === 503 || res.status === 504) {
+        if (
+          res.status === 404 ||
+          res.status === 502 ||
+          res.status === 503 ||
+          res.status === 504 ||
+          getClientApiKey() !== ''
+        ) {
           return await directGeminiFallback(url, payload);
         }
         throw new Error(parsed?.error || `Request failed (${res.status})`);
@@ -503,10 +529,15 @@ export default function App() {
 
       return parsed;
     } catch (err) {
-      // Network error or failed server route -> attempt direct fallback before surfacing error
-      return await directGeminiFallback(url, payload).catch((fallbackErr) => {
-        throw fallbackErr instanceof Error ? fallbackErr : err;
-      });
+      if (getClientApiKey() !== '') {
+        return await directGeminiFallback(url, payload).catch((fallbackErr) => {
+          throw fallbackErr instanceof Error ? fallbackErr : err;
+        });
+      }
+      if (err instanceof Error) {
+        throw err;
+      }
+      return await directGeminiFallback(url, payload);
     }
   };
 
