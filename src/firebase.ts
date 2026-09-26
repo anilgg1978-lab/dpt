@@ -1,5 +1,12 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+} from 'firebase/auth';
 import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
@@ -7,6 +14,7 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 async function testConnection() {
   try {
@@ -73,6 +81,14 @@ export function handleFirestoreError(
 
 export async function loginWithGoogle() {
   return signInWithPopup(auth, googleProvider);
+}
+
+export async function loginWithGoogleRedirect() {
+  return signInWithRedirect(auth, googleProvider);
+}
+
+export async function checkGoogleRedirectResult() {
+  return getRedirectResult(auth);
 }
 
 export async function logoutUser() {

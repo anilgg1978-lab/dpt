@@ -22,6 +22,8 @@ import {
   auth,
   db,
   loginWithGoogle,
+  loginWithGoogleRedirect,
+  checkGoogleRedirectResult,
   logoutUser,
   handleFirestoreError,
   OperationType,
@@ -87,20 +89,57 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showModelModal, setShowModelModal] = useState(false);
   const [showReasoningModal, setShowReasoningModal] = useState(false);
+  const [unauthorizedDomainHost, setUnauthorizedDomainHost] = useState<string | null>(null);
 
   // Firebase Auth & Persistence State
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [threads, setThreads] = useState<ThreadSummary[]>([
-    {
-      id: 'local-default',
-      title: 'Welcome to NexusChat',
-      modelId: 'gemini-3.8-flash',
-      reasoningEffort: 'Medium',
-    },
-  ]);
+  const [threads, setThreads] = useState<ThreadSummary[]>(() => {
+    try {
+      const saved = localStorage.getItem('nexuschat_local_threads');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return [
+      {
+        id: 'local-default',
+        title: 'Welcome to NexusChat',
+        modelId: 'gemini-3.8-flash',
+        reasoningEffort: 'Medium',
+      },
+    ];
+  });
   const [activeThreadId, setActiveThreadId] = useState<string>('local-default');
-  const [messages, setMessages] = useState<MessageItem[]>([]);
+  const [localMessagesMap, setLocalMessagesMap] = useState<Record<string, MessageItem[]>>(() => {
+    try {
+      const saved = localStorage.getItem('nexuschat_local_messages');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return {};
+  });
+  const [messages, setMessages] = useState<MessageItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('nexuschat_local_messages');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && Array.isArray(parsed['local-default'])) {
+          return parsed['local-default'];
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return [];
+  });
 
   // Model & Reasoning Config
   const [selectedModel, setSelectedModel] = useState<GeminiModelId>('gemini-3.8-flash');
@@ -541,14 +580,82 @@ export default function App() {
     }
   };
 
-  // 1. Listen to Firebase Auth State
+  // 1. Listen to Firebase Auth State & Redirect Result
   useEffect(() => {
+    checkGoogleRedirectResult().catch((err) => {
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/unauthorized-domain') {
+        setUnauthorizedDomainHost(window.location.hostname || 'your-domain.vercel.app');
+      }
+    });
     const unsub = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       setAuthReady(true);
     });
     return () => unsub();
   }, []);
+
+  // Persist local threads & messages when signed out
+  useEffect(() => {
+    if (!user) {
+      try {
+        localStorage.setItem('nexuschat_local_threads', JSON.stringify(threads));
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+  }, [threads, user]);
+
+  useEffect(() => {
+    if (!user && activeThreadId.startsWith('local-')) {
+      setLocalMessagesMap((prev) => {
+        const next = { ...prev, [activeThreadId]: messages };
+        try {
+          localStorage.setItem('nexuschat_local_messages', JSON.stringify(next));
+        } catch {
+          // ignore storage quota errors
+        }
+        return next;
+      });
+    }
+  }, [messages, activeThreadId, user]);
+
+  const handleGoogleSignIn = async () => {
+    try {
+      await loginWithGoogle();
+      showToast('Signed in with Google');
+    } catch (err) {
+      const code = (err as { code?: string })?.code || '';
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+        setUnauthorizedDomainHost(window.location.hostname || 'your-app.vercel.app');
+        return;
+      }
+
+      if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
+        showToast('Popup blocked — redirecting to Google Sign-In...');
+        try {
+          await loginWithGoogleRedirect();
+        } catch (redirErr) {
+          const redirCode = (redirErr as { code?: string })?.code || '';
+          if (redirCode === 'auth/unauthorized-domain') {
+            setUnauthorizedDomainHost(window.location.hostname || 'your-app.vercel.app');
+          } else {
+            showToast('Unable to open Google Sign-In. Please allow popups for this site.');
+          }
+        }
+        return;
+      }
+
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        showToast('Sign-in popup was closed before finishing');
+        return;
+      }
+
+      showToast(`Sign-in failed (${code || 'auth-error'}): ${msg}`);
+    }
+  };
 
   // 2. Sync User Threads from Firestore when Authenticated
   useEffect(() => {
@@ -1136,6 +1243,9 @@ export default function App() {
                   key={t.id}
                   onClick={() => {
                     setActiveThreadId(t.id);
+                    if (!user && t.id.startsWith('local-')) {
+                      setMessages(localMessagesMap[t.id] || []);
+                    }
                     setActiveTab('chat');
                   }}
                   className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm cursor-pointer transition-colors ${
@@ -1201,17 +1311,13 @@ export default function App() {
           ) : (
             <button
               type="button"
-              onClick={() =>
-                loginWithGoogle().catch(() =>
-                  showToast('Sign-in popup was closed')
-                )
-              }
+              onClick={handleGoogleSignIn}
               className="w-full py-2 px-3 rounded-xl bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer"
             >
               <span className="material-symbols-outlined text-[16px] text-primary">
                 login
               </span>
-              <span>Sign in with Google to Save Chats</span>
+              <span>Sign in with Google to Sync Cloud</span>
             </button>
           )}
         </div>
@@ -2120,6 +2226,100 @@ export default function App() {
             >
               Done
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* UNAUTHORIZED DOMAIN MODAL (FOR VERCEL / CUSTOM DOMAINS) */}
+      {unauthorizedDomainHost && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setUnauthorizedDomainHost(null)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl bg-surface-container border border-outline-variant/30 p-6 shadow-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <span className="material-symbols-outlined text-primary text-[22px]">
+                  verified_user
+                </span>
+                <h3 className="text-base font-semibold text-on-surface">
+                  Authorize Your Domain in Firebase
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUnauthorizedDomainHost(null)}
+                className="text-on-surface-variant hover:text-on-surface cursor-pointer"
+              >
+                <span className="material-symbols-outlined text-[20px]">close</span>
+              </button>
+            </div>
+
+            <p className="text-xs text-on-surface-variant leading-relaxed">
+              Firebase Authentication blocks Google Sign-In on new domains until you add the domain to your Firebase project&apos;s <strong>Authorized domains</strong> list.
+            </p>
+
+            <div className="p-3 rounded-xl bg-surface-container-lowest border border-outline-variant/25 flex items-center justify-between gap-2">
+              <code className="text-xs font-mono text-primary truncate">
+                {unauthorizedDomainHost}
+              </code>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(unauthorizedDomainHost);
+                  showToast('Domain copied to clipboard');
+                }}
+                className="px-2.5 py-1 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium shrink-0 cursor-pointer"
+              >
+                Copy Domain
+              </button>
+            </div>
+
+            <ol className="text-xs text-on-surface-variant space-y-2 list-decimal list-inside leading-relaxed">
+              <li>
+                Open{' '}
+                <a
+                  href="https://console.firebase.google.com/project/sodium-acrobat-6mn89/authentication/settings"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-primary underline hover:opacity-90 font-medium"
+                >
+                  Firebase Console → Authentication → Settings
+                </a>
+                .
+              </li>
+              <li>
+                Scroll to <strong>Authorized domains</strong> and click <strong>Add domain</strong>.
+              </li>
+              <li>
+                Paste <code className="text-on-surface font-mono">{unauthorizedDomainHost}</code> and click <strong>Add</strong>.
+              </li>
+            </ol>
+
+            <div className="p-3 rounded-xl bg-primary/10 border border-primary/20 text-[11px] text-on-surface-variant">
+              Note: Your chats are already automatically saved locally in your browser even before you sign in.
+            </div>
+
+            <div className="flex items-center gap-2 pt-1">
+              <a
+                href="https://console.firebase.google.com/project/sodium-acrobat-6mn89/authentication/settings"
+                target="_blank"
+                rel="noreferrer"
+                className="flex-1 py-2.5 px-3 rounded-xl bg-primary text-on-primary font-semibold text-xs text-center hover:opacity-95 transition-opacity"
+              >
+                Open Firebase Console
+              </a>
+              <button
+                type="button"
+                onClick={() => setUnauthorizedDomainHost(null)}
+                className="py-2.5 px-4 rounded-xl bg-surface-container-high text-on-surface font-medium text-xs cursor-pointer"
+              >
+                Got It
+              </button>
+            </div>
           </div>
         </div>
       )}
