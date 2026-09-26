@@ -1,0 +1,127 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net (Default-Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidChatThread(data) {
+      return data.keys().hasAll(['ownerId', 'title', 'modelId', 'reasoningEffort', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'title', 'modelId', 'reasoningEffort', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 200
+        && data.modelId is string
+        && data.modelId.size() >= 1
+        && data.modelId.size() <= 64
+        && data.reasoningEffort is string
+        && data.reasoningEffort.size() >= 3
+        && data.reasoningEffort.size() <= 16
+        && (data.reasoningEffort == 'Low' || data.reasoningEffort == 'Medium' || data.reasoningEffort == 'High')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data, parentThreadId) {
+      return data.keys().hasAll(['threadId', 'ownerId', 'role', 'text', 'mode', 'createdAt'])
+        && data.keys().hasOnly(['threadId', 'ownerId', 'role', 'text', 'mode', 'createdAt'])
+        && data.threadId is string
+        && data.threadId.size() >= 1
+        && data.threadId.size() <= 128
+        && data.threadId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.threadId == parentThreadId
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.role is string
+        && data.role.size() >= 4
+        && data.role.size() <= 16
+        && (data.role == 'user' || data.role == 'assistant')
+        && data.text is string
+        && data.text.size() >= 1
+        && data.text.size() <= 20000
+        && data.mode is string
+        && data.mode.size() >= 1
+        && data.mode.size() <= 32
+        && data.createdAt is timestamp;
+    }
+
+    // Collection: /threads/{threadId}
+    match /threads/{threadId} {
+      allow get: if isSignedIn() && isValidId(threadId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+
+      allow create: if isSignedIn()
+        && isValidId(threadId)
+        && isValidChatThread(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(threadId)
+        && isValidChatThread(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Rename or update model/effort settings
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'modelId', 'reasoningEffort', 'updatedAt'])
+        );
+
+      allow delete: if isSignedIn() && isValidId(threadId) && existing().ownerId == request.auth.uid;
+
+      // Subcollection: /threads/{threadId}/messages/{messageId}
+      match /messages/{messageId} {
+        allow get: if isSignedIn()
+          && isValidId(threadId)
+          && isValidId(messageId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/threads/$(threadId)).data.ownerId == request.auth.uid;
+
+        allow list: if isSignedIn()
+          && existing().ownerId == request.auth.uid;
+
+        allow create: if isSignedIn()
+          && isValidId(threadId)
+          && isValidId(messageId)
+          && isValidChatMessage(incoming(), threadId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/threads/$(threadId))
+          && get(/databases/$(database)/documents/threads/$(threadId)).data.ownerId == request.auth.uid;
+
+        allow delete: if isSignedIn()
+          && isValidId(threadId)
+          && isValidId(messageId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/threads/$(threadId)).data.ownerId == request.auth.uid;
+      }
+    }
+  }
+}

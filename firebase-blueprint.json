@@ -1,0 +1,104 @@
+{
+  "entities": {
+    "ChatThread": {
+      "title": "ChatThread",
+      "description": "A user's conversation thread stored in Firestore.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "The UID of the authenticated user who owns this thread.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the conversation thread.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "modelId": {
+          "type": "string",
+          "description": "Selected model identifier for the thread.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "reasoningEffort": {
+          "type": "string",
+          "description": "Reasoning effort preset (Low, Medium, High).",
+          "enum": ["Low", "Medium", "High"],
+          "minLength": 3,
+          "maxLength": 16
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when thread was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when thread was last updated."
+        }
+      },
+      "required": ["ownerId", "title", "modelId", "reasoningEffort", "createdAt", "updatedAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A single message inside a user's conversation thread.",
+      "type": "object",
+      "properties": {
+        "threadId": {
+          "type": "string",
+          "description": "ID of the parent ChatThread.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the user who owns the thread and message.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "description": "Sender role: user or assistant.",
+          "enum": ["user", "assistant"],
+          "minLength": 4,
+          "maxLength": 16
+        },
+        "text": {
+          "type": "string",
+          "description": "Text content of the message.",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "mode": {
+          "type": "string",
+          "description": "Mode or tool used (chat, search, maps, image, video, music).",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when message was created."
+        }
+      },
+      "required": ["threadId", "ownerId", "role", "text", "mode", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/threads/{threadId}": {
+      "schema": { "$ref": "#/entities/ChatThread" },
+      "description": "Top-level collection of user chat threads."
+    },
+    "/threads/{threadId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Subcollection of messages belonging to a specific chat thread."
+    }
+  }
+}
