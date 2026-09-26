@@ -164,38 +164,350 @@ export default function App() {
     }, 3500);
   };
 
-  // Safe JSON POST helper that handles non-JSON responses and server warm-up
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const safePostJson = async (url: string, payload: Record<string, unknown>, retries = 1): Promise<any> => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    const rawText = await res.text();
+  const getClientApiKey = (): string => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let parsed: any = null;
-    try {
-      parsed = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      // Response was plain text or HTML (e.g. "The page could not be found" during server restart)
-      if (retries > 0) {
-        await new Promise((r) => setTimeout(r, 1200));
-        return safePostJson(url, payload, retries - 1);
+    const win = window as any;
+    const envKey =
+      typeof process !== 'undefined' && process.env?.GEMINI_API_KEY
+        ? process.env.GEMINI_API_KEY
+        : '';
+    if (envKey && envKey !== 'GEMINI_API_KEY') return envKey;
+    if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_GEMINI_API_KEY) {
+      return import.meta.env.VITE_GEMINI_API_KEY;
+    }
+    return win.GEMINI_API_KEY || win.API_KEY || envKey || 'GEMINI_API_KEY';
+  };
+
+  // Direct REST fallback when /api/* routes are not mounted (e.g. static preview or Vercel static hosting)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const directGeminiFallback = async (url: string, payload: Record<string, any>): Promise<any> => {
+    const apiKey = getClientApiKey();
+    const baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+
+    if (url === '/api/chat') {
+      const messages = (payload.messages || []) as Array<{ role: string; text: string }>;
+      const contents = messages.map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.text }],
+      }));
+
+      const tools: Array<Record<string, unknown>> = [];
+      if (payload.useMaps) {
+        tools.push({ googleMaps: {} });
+      } else if (payload.useSearch) {
+        tools.push({ googleSearch: {} });
       }
-      throw new Error(
-        res.status === 404
-          ? 'API endpoint is warming up. Please try sending your message again.'
-          : `Server returned an unexpected response (${res.status}). Please try again.`
+
+      const candidates = Array.from(
+        new Set([
+          payload.model || 'gemini-3.5-flash',
+          'gemini-3.5-flash',
+          'gemini-flash-latest',
+          'gemini-3.1-flash-lite',
+          'gemini-3.8-flash',
+        ])
       );
+
+      let lastErr = 'Chat generation failed';
+      for (const modelName of candidates) {
+        const res = await fetch(
+          `${baseUrl}/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents,
+              systemInstruction: {
+                parts: [
+                  {
+                    text: 'You are Nexus, a clear, helpful, and concise AI assistant. Format answers cleanly using markdown.',
+                  },
+                ],
+              },
+              ...(tools.length > 0 ? { tools } : {}),
+            }),
+          }
+        );
+
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.candidates?.[0]?.content?.parts) {
+          const parts = data.candidates[0].content.parts as Array<{
+            text?: string;
+            thought?: boolean;
+          }>;
+          const text = parts
+            .filter((p) => !p.thought && typeof p.text === 'string')
+            .map((p) => p.text)
+            .join('');
+
+          const rawChunks =
+            data.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          const sources: { title: string; uri: string; type: 'web' | 'maps' }[] = [];
+          for (const chunk of rawChunks) {
+            if (chunk.web?.uri) {
+              sources.push({
+                title: chunk.web.title || chunk.web.uri,
+                uri: chunk.web.uri,
+                type: 'web',
+              });
+            }
+            if (chunk.maps?.uri) {
+              sources.push({
+                title: chunk.maps.title || 'Google Maps Place',
+                uri: chunk.maps.uri,
+                type: 'maps',
+              });
+            }
+          }
+
+          return { text: text || 'No response generated.', modelUsed: modelName, sources };
+        }
+        lastErr = data?.error?.message || `Model ${modelName} returned ${res.status}`;
+      }
+      throw new Error(lastErr);
     }
 
-    if (!res.ok) {
-      throw new Error(parsed?.error || `Request failed (${res.status})`);
+    if (url === '/api/transcribe') {
+      const transcribeModels = [
+        'gemini-3.5-transcribe',
+        'gemini-3.5-flash',
+        'gemini-flash-latest',
+      ];
+      let lastErr = 'Audio transcription failed';
+      for (const m of transcribeModels) {
+        const res = await fetch(
+          `${baseUrl}/models/${m}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      inlineData: {
+                        mimeType: payload.mimeType || 'audio/webm',
+                        data: payload.audioBase64,
+                      },
+                    },
+                    { text: 'Transcribe this audio accurately.' },
+                  ],
+                },
+              ],
+            }),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.candidates?.[0]?.content?.parts) {
+          const text = data.candidates[0].content.parts
+            .map((p: { text?: string }) => p.text || '')
+            .join('')
+            .trim();
+          return { text };
+        }
+        lastErr = data?.error?.message || lastErr;
+      }
+      throw new Error(lastErr);
     }
 
-    return parsed;
+    if (url === '/api/image') {
+      const parts: Array<Record<string, unknown>> = [];
+      if (payload.imageBase64) {
+        parts.push({
+          inlineData: {
+            data: payload.imageBase64,
+            mimeType: payload.imageMimeType || 'image/png',
+          },
+        });
+      }
+      parts.push({
+        text: payload.prompt || 'Generate a high-resolution artistic image',
+      });
+
+      const imgModels = [
+        'gemini-3.1-flash-image-preview',
+        'gemini-3.1-flash-image',
+        'gemini-3.1-flash-lite-image',
+      ];
+      let lastErr = 'Image generation failed';
+      for (const m of imgModels) {
+        const res = await fetch(
+          `${baseUrl}/models/${m}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts }],
+              generationConfig: {
+                imageConfig: {
+                  aspectRatio: payload.aspectRatio || '1:1',
+                },
+              },
+            }),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.candidates?.[0]?.content?.parts) {
+          for (const part of data.candidates[0].content.parts) {
+            if (part.inlineData?.data) {
+              const mime = part.inlineData.mimeType || 'image/png';
+              return {
+                imageUrl: `data:${mime};base64,${part.inlineData.data}`,
+              };
+            }
+          }
+        }
+        lastErr = data?.error?.message || lastErr;
+      }
+      throw new Error(lastErr);
+    }
+
+    if (url === '/api/generate-video') {
+      const validAspect = payload.aspectRatio === '9:16' ? '9:16' : '16:9';
+      const videoModels = [
+        'veo-3.1-fast-generate-preview',
+        'veo-3.1-lite-generate-preview',
+      ];
+      let lastErr = 'Video generation failed to start';
+      for (const m of videoModels) {
+        const instance: Record<string, unknown> = {
+          prompt:
+            payload.prompt ||
+            'Cinematic slow-motion camera movement with natural lighting',
+        };
+        if (payload.imageBase64) {
+          instance.image = {
+            bytesBase64Encoded: payload.imageBase64,
+            mimeType: payload.imageMimeType || 'image/png',
+          };
+        }
+        const res = await fetch(
+          `${baseUrl}/models/${m}:predictLongRunning?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              instances: [instance],
+              parameters: {
+                aspectRatio: validAspect,
+                sampleCount: 1,
+                resolution: '720p',
+              },
+            }),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.name) {
+          return { operationName: data.name };
+        }
+        lastErr = data?.error?.message || lastErr;
+      }
+      throw new Error(lastErr);
+    }
+
+    if (url === '/api/video-status') {
+      const res = await fetch(
+        `${baseUrl}/${payload.operationName}?key=${encodeURIComponent(apiKey)}`
+      );
+      const data = await res.json().catch(() => ({}));
+      const uri =
+        data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
+        data?.response?.generatedVideos?.[0]?.video?.uri ||
+        null;
+      return { done: Boolean(data.done), videoUri: uri };
+    }
+
+    if (url === '/api/music') {
+      const model =
+        payload.durationType === 'pro'
+          ? 'lyria-3-pro-preview'
+          : 'lyria-3-clip-preview';
+      const res = await fetch(
+        `${baseUrl}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text:
+                      payload.prompt ||
+                      'Generate an uplifting ambient electronic track.',
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+            },
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.candidates?.[0]?.content?.parts) {
+        let audioBase64 = '';
+        let lyrics = '';
+        let mimeType = 'audio/wav';
+        for (const part of data.candidates[0].content.parts) {
+          if (part.inlineData?.data) {
+            if (!audioBase64 && part.inlineData.mimeType) {
+              mimeType = part.inlineData.mimeType;
+            }
+            audioBase64 += part.inlineData.data;
+          }
+          if (part.text && !lyrics) {
+            lyrics = part.text;
+          }
+        }
+        if (audioBase64) {
+          return { audioBase64, mimeType, lyrics, modelUsed: model };
+        }
+      }
+      throw new Error(data?.error?.message || 'Music generation failed');
+    }
+
+    throw new Error(`Unsupported endpoint: ${url}`);
+  };
+
+  // Safe JSON POST helper that tries /api/* first and seamlessly falls back to direct Gemini REST if /api/* returns 404 or non-JSON
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const safePostJson = async (url: string, payload: Record<string, unknown>): Promise<any> => {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const rawText = await res.text();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let parsed: any = null;
+      try {
+        parsed = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        // Non-JSON response (e.g. 404 "The page could not be found" on static host) -> use direct fallback
+        return await directGeminiFallback(url, payload);
+      }
+
+      if (!res.ok) {
+        if (res.status === 404 || res.status === 502 || res.status === 503 || res.status === 504) {
+          return await directGeminiFallback(url, payload);
+        }
+        throw new Error(parsed?.error || `Request failed (${res.status})`);
+      }
+
+      return parsed;
+    } catch (err) {
+      // Network error or failed server route -> attempt direct fallback before surfacing error
+      return await directGeminiFallback(url, payload).catch((fallbackErr) => {
+        throw fallbackErr instanceof Error ? fallbackErr : err;
+      });
+    }
   };
 
   // 1. Listen to Firebase Auth State
@@ -552,6 +864,7 @@ export default function App() {
       const operationName = startData.operationName;
       let isDone = false;
       let attempts = 0;
+      let directVideoUri: string | null = null;
 
       while (!isDone && attempts < 60) {
         attempts++;
@@ -562,16 +875,25 @@ export default function App() {
         const statusData = await safePostJson('/api/video-status', { operationName });
         if (statusData.done) {
           isDone = true;
+          directVideoUri = statusData.videoUri || null;
         }
       }
 
       setVideoStatusText('Downloading generated MP4 stream...');
-      const dlRes = await fetch('/api/video-download', {
+      let dlRes = await fetch('/api/video-download', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ operationName }),
-      });
-      if (!dlRes.ok) throw new Error('Failed to download completed video');
+      }).catch(() => null);
+
+      if ((!dlRes || !dlRes.ok) && directVideoUri) {
+        dlRes = await fetch(directVideoUri, {
+          headers: { 'x-goog-api-key': getClientApiKey() },
+        });
+      }
+
+      if (!dlRes || !dlRes.ok) throw new Error('Failed to download completed video');
       const videoBlob = await dlRes.blob();
       setGeneratedVideoUrl(URL.createObjectURL(videoBlob));
       setVideoStatusText('');
