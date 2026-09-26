@@ -1,0 +1,6 @@
+{
+  "name": "NexusChat",
+  "description": "Enterprise AI engineering workspace with granular reasoning effort controls, model weight switching, and tactile audio-visual feedback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
