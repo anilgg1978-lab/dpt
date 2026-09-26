@@ -6,7 +6,6 @@ import { WebSocketServer } from 'ws';
 import path from 'path';
 import {
   GoogleGenAI,
-  ThinkingLevel,
   GenerateVideosOperation,
   LiveServerMessage,
   Modality,
@@ -29,11 +28,31 @@ function getAiClient() {
   });
 }
 
+function formatCleanError(error: unknown, fallbackMsg: string): string {
+  if (error instanceof Error) {
+    try {
+      const parsed = JSON.parse(error.message);
+      if (parsed?.error?.message) {
+        return parsed.error.message;
+      }
+    } catch {
+      // not JSON
+    }
+    return error.message;
+  }
+  return fallbackMsg;
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
   const httpServer = createHttpServer(app);
+
+  // Health check endpoint
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+  });
 
   // 1. Multi-turn Gemini Chat + Google Search Grounding + Google Maps Grounding
   app.post('/api/chat', async (req, res) => {
@@ -41,21 +60,10 @@ async function startServer() {
       const ai = getAiClient();
       const {
         messages = [],
-        model = 'gemini-3.8-flash',
-        reasoningEffort = 'Medium',
+        model = 'gemini-3.5-flash',
         useSearch = false,
         useMaps = false,
       } = req.body;
-
-      // Map UI model selection to valid Gemini 3 models
-      let targetModel = 'gemini-3.8-flash';
-      if (model === 'gemini-3.1-pro-preview' || model === 'pro') {
-        targetModel = 'gemini-3.1-pro-preview';
-      } else if (model === 'gemini-3.1-flash-lite' || model === 'lite') {
-        targetModel = 'gemini-3.1-flash-lite';
-      } else {
-        targetModel = 'gemini-3.8-flash';
-      }
 
       // Build contents array for multi-turn conversation
       const contents = messages.map((m: { role: string; text: string }) => ({
@@ -63,7 +71,7 @@ async function startServer() {
         parts: [{ text: m.text }],
       }));
 
-      // Configure tools (Note: googleMaps cannot be combined with googleSearch in the same call)
+      // Configure tools (googleMaps cannot be combined with googleSearch in the same request)
       const tools: Array<Record<string, unknown>> = [];
       if (useMaps) {
         tools.push({ googleMaps: {} });
@@ -71,19 +79,43 @@ async function startServer() {
         tools.push({ googleSearch: {} });
       }
 
-      const thinkingLevel =
-        reasoningEffort === 'Low' ? ThinkingLevel.LOW : ThinkingLevel.HIGH;
+      // Build resilient fallback list starting with the user's chosen model
+      const candidateModels = Array.from(
+        new Set([
+          model,
+          'gemini-3.5-flash',
+          'gemini-flash-latest',
+          'gemini-3.1-flash-lite',
+          'gemini-3.8-flash',
+        ])
+      );
 
-      const response = await ai.models.generateContent({
-        model: targetModel,
-        contents,
-        config: {
-          systemInstruction:
-            'You are Nexus, a clear, helpful, and concise AI assistant. Format answers cleanly using markdown.',
-          thinkingConfig: { thinkingLevel },
-          ...(tools.length > 0 ? { tools } : {}),
-        },
-      });
+      let response = null;
+      let modelUsed = candidateModels[0];
+      let lastError: unknown = null;
+
+      for (const candidate of candidateModels) {
+        try {
+          response = await ai.models.generateContent({
+            model: candidate,
+            contents,
+            config: {
+              systemInstruction:
+                'You are Nexus, a clear, helpful, and concise AI assistant. Format answers cleanly using markdown.',
+              ...(tools.length > 0 ? { tools } : {}),
+            },
+          });
+          modelUsed = candidate;
+          break;
+        } catch (err) {
+          lastError = err;
+          console.warn(`Model ${candidate} failed, trying next fallback...`);
+        }
+      }
+
+      if (!response) {
+        throw lastError || new Error('All Gemini models are currently busy.');
+      }
 
       // Extract grounding sources if present
       const rawChunks =
@@ -112,18 +144,18 @@ async function startServer() {
 
       res.json({
         text: response.text || '',
-        modelUsed: targetModel,
+        modelUsed,
         sources,
       });
     } catch (error) {
       console.error('Chat API error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Chat generation failed',
+        error: formatCleanError(error, 'Chat generation failed'),
       });
     }
   });
 
-  // 2. Create & Edit Images (gemini-3.1-flash-image / gemini-3.1-flash-lite-image)
+  // 2. Create & Edit Images (gemini-3.1-flash-image-preview / gemini-3.1-flash-image / gemini-3.1-flash-lite-image)
   app.post('/api/image', async (req, res) => {
     try {
       const ai = getAiClient();
@@ -145,29 +177,34 @@ async function startServer() {
       }
       parts.push({ text: prompt || 'Generate a high-resolution artistic image' });
 
-      let response;
-      try {
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-image',
-          contents: { parts },
-          config: {
-            imageConfig: {
-              aspectRatio,
-              imageSize: '1K',
+      const imageModels = [
+        'gemini-3.1-flash-image-preview',
+        'gemini-3.1-flash-image',
+        'gemini-3.1-flash-lite-image',
+      ];
+
+      let response = null;
+      let lastErr: unknown = null;
+
+      for (const imgModel of imageModels) {
+        try {
+          response = await ai.models.generateContent({
+            model: imgModel,
+            contents: { parts },
+            config: {
+              imageConfig: {
+                aspectRatio,
+              },
             },
-          },
-        });
-      } catch {
-        // Fallback to gemini-3.1-flash-lite-image if flash-image is unavailable
-        response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-image',
-          contents: { parts },
-          config: {
-            imageConfig: {
-              aspectRatio,
-            },
-          },
-        });
+          });
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!response) {
+        throw lastErr || new Error('Image generation failed');
       }
 
       let generatedImageUrl: string | null = null;
@@ -191,12 +228,12 @@ async function startServer() {
     } catch (error) {
       console.error('Image API error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Image generation failed',
+        error: formatCleanError(error, 'Image generation failed'),
       });
     }
   });
 
-  // 3. Veo Video Generation (From Text OR Animate Uploaded Photo)
+  // 3. Veo Video Generation (veo-3.1-fast-generate-preview / veo-3.1-lite-generate-preview)
   app.post('/api/generate-video', async (req, res) => {
     try {
       const ai = getAiClient();
@@ -209,30 +246,51 @@ async function startServer() {
 
       const validAspect = aspectRatio === '9:16' ? '9:16' : '16:9';
 
-      const params: Record<string, unknown> = {
-        model: 'veo-3.1-lite-generate-preview',
-        prompt: prompt || 'Cinematic slow-motion camera movement with natural lighting',
-        config: {
-          numberOfVideos: 1,
-          resolution: '720p',
-          aspectRatio: validAspect,
-        },
-      };
+      const videoModels = [
+        'veo-3.1-fast-generate-preview',
+        'veo-3.1-lite-generate-preview',
+      ];
 
-      if (imageBase64) {
-        params.image = {
-          imageBytes: imageBase64,
-          mimeType: imageMimeType,
-        };
+      let operation = null;
+      let lastErr: unknown = null;
+
+      for (const veoModel of videoModels) {
+        try {
+          const params: Record<string, unknown> = {
+            model: veoModel,
+            prompt:
+              prompt || 'Cinematic slow-motion camera movement with natural lighting',
+            config: {
+              numberOfVideos: 1,
+              resolution: '720p',
+              aspectRatio: validAspect,
+            },
+          };
+
+          if (imageBase64) {
+            params.image = {
+              imageBytes: imageBase64,
+              mimeType: imageMimeType,
+            };
+          }
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          operation = await ai.models.generateVideos(params as any);
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const operation = await ai.models.generateVideos(params as any);
+      if (!operation) {
+        throw lastErr || new Error('Failed to start video generation');
+      }
+
       res.json({ operationName: operation.name });
     } catch (error) {
       console.error('Video start error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Video generation failed to start',
+        error: formatCleanError(error, 'Video generation failed to start'),
       });
     }
   });
@@ -248,7 +306,7 @@ async function startServer() {
     } catch (error) {
       console.error('Video poll error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Video status check failed',
+        error: formatCleanError(error, 'Video status check failed'),
       });
     }
   });
@@ -290,7 +348,7 @@ async function startServer() {
     } catch (error) {
       console.error('Video download error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Video download failed',
+        error: formatCleanError(error, 'Video download failed'),
       });
     }
   });
@@ -339,7 +397,7 @@ async function startServer() {
     } catch (error) {
       console.error('Music API error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Music generation failed',
+        error: formatCleanError(error, 'Music generation failed'),
       });
     }
   });
@@ -369,7 +427,7 @@ async function startServer() {
     } catch (error) {
       console.error('Transcribe API error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Audio transcription failed',
+        error: formatCleanError(error, 'Audio transcription failed'),
       });
     }
   });
@@ -447,7 +505,7 @@ async function startServer() {
       console.error('Live connection setup failed:', error);
       clientWs.send(
         JSON.stringify({
-          error: error instanceof Error ? error.message : 'Live API failed to connect',
+          error: formatCleanError(error, 'Live API failed to connect'),
         })
       );
       clientWs.close();

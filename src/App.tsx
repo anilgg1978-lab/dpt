@@ -161,7 +161,41 @@ export default function App() {
     setToast(msg);
     setTimeout(() => {
       setToast((prev) => (prev === msg ? null : prev));
-    }, 3000);
+    }, 3500);
+  };
+
+  // Safe JSON POST helper that handles non-JSON responses and server warm-up
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const safePostJson = async (url: string, payload: Record<string, unknown>, retries = 1): Promise<any> => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const rawText = await res.text();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let parsed: any = null;
+    try {
+      parsed = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      // Response was plain text or HTML (e.g. "The page could not be found" during server restart)
+      if (retries > 0) {
+        await new Promise((r) => setTimeout(r, 1200));
+        return safePostJson(url, payload, retries - 1);
+      }
+      throw new Error(
+        res.status === 404
+          ? 'API endpoint is warming up. Please try sending your message again.'
+          : `Server returned an unexpected response (${res.status}). Please try again.`
+      );
+    }
+
+    if (!res.ok) {
+      throw new Error(parsed?.error || `Request failed (${res.status})`);
+    }
+
+    return parsed;
   };
 
   // 1. Listen to Firebase Auth State
@@ -365,22 +399,13 @@ export default function App() {
         );
       }
 
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: updatedHistory.map((m) => ({ role: m.role, text: m.text })),
-          model: selectedModel,
-          reasoningEffort,
-          useSearch: searchActive,
-          useMaps: mapsActive,
-        }),
+      const data = await safePostJson('/api/chat', {
+        messages: updatedHistory.map((m) => ({ role: m.role, text: m.text })),
+        model: selectedModel,
+        reasoningEffort,
+        useSearch: searchActive,
+        useMaps: mapsActive,
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to generate response');
-      }
 
       const assistantText = data.text || 'No response generated.';
       const assistantMsg: MessageItem = {
@@ -440,23 +465,18 @@ export default function App() {
           if (!base64Str) return;
           setIsTranscribing(true);
           try {
-            const res = await fetch('/api/transcribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                audioBase64: base64Str,
-                mimeType: blob.type || 'audio/webm',
-              }),
+            const data = await safePostJson('/api/transcribe', {
+              audioBase64: base64Str,
+              mimeType: blob.type || 'audio/webm',
             });
-            const data = await res.json();
             if (data.text) {
               setInputPrompt((prev) => (prev ? `${prev} ${data.text}` : data.text));
               showToast('Audio transcribed!');
             } else if (data.error) {
               showToast(data.error);
             }
-          } catch {
-            showToast('Failed to transcribe audio');
+          } catch (err) {
+            showToast(err instanceof Error ? err.message : 'Failed to transcribe audio');
           } finally {
             setIsTranscribing(false);
           }
@@ -500,18 +520,12 @@ export default function App() {
     setIsGeneratingImage(true);
     setGeneratedImageUrl(null);
     try {
-      const res = await fetch('/api/image', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: imagePrompt,
-          aspectRatio: imageAspect,
-          imageBase64: uploadImageBase64,
-          imageMimeType: uploadImageMime,
-        }),
+      const data = await safePostJson('/api/image', {
+        prompt: imagePrompt,
+        aspectRatio: imageAspect,
+        imageBase64: uploadImageBase64,
+        imageMimeType: uploadImageMime,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Image generation failed');
       setGeneratedImageUrl(data.imageUrl);
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Image generation failed');
@@ -528,18 +542,12 @@ export default function App() {
     setVideoStatusText('Starting Veo 3.1 video generation...');
 
     try {
-      const startRes = await fetch('/api/generate-video', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: videoPrompt,
-          aspectRatio: videoAspect,
-          imageBase64: videoPhotoBase64,
-          imageMimeType: videoPhotoMime,
-        }),
+      const startData = await safePostJson('/api/generate-video', {
+        prompt: videoPrompt,
+        aspectRatio: videoAspect,
+        imageBase64: videoPhotoBase64,
+        imageMimeType: videoPhotoMime,
       });
-      const startData = await startRes.json();
-      if (!startRes.ok) throw new Error(startData.error || 'Failed to start video');
 
       const operationName = startData.operationName;
       let isDone = false;
@@ -551,12 +559,7 @@ export default function App() {
           `Rendering video frames with Veo 3.1... (${attempts * 5}s elapsed)`
         );
         await new Promise((r) => setTimeout(r, 5000));
-        const statusRes = await fetch('/api/video-status', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ operationName }),
-        });
-        const statusData = await statusRes.json();
+        const statusData = await safePostJson('/api/video-status', { operationName });
         if (statusData.done) {
           isDone = true;
         }
@@ -587,16 +590,10 @@ export default function App() {
     setGeneratedAudioUrl(null);
     setGeneratedLyrics('');
     try {
-      const res = await fetch('/api/music', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: musicPrompt,
-          durationType: musicDurationType,
-        }),
+      const data = await safePostJson('/api/music', {
+        prompt: musicPrompt,
+        durationType: musicDurationType,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Music generation failed');
 
       const binary = atob(data.audioBase64);
       const bytes = new Uint8Array(binary.length);
